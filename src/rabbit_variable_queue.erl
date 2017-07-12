@@ -820,6 +820,7 @@ set_ram_duration_target(DurationTarget,
     io:format("set_ram_duration_target Mode ~p InitMode ~p DurationTarget ~p TargetRamCount ~p~n",
               [lazy, lazy_init, DurationTarget, TargetRamCount]),
     State1 = reduce_memory_use(State0),
+    % Note: NOT asserting state here
     State1#vqstate{memory_reduction_run_count = 0};
 set_ram_duration_target(
   DurationTarget, State = #vqstate {
@@ -842,7 +843,6 @@ set_ram_duration_target(
                  false -> maybe_reduce_memory_use(State1)
              end,
     a(State2).
-
 
 maybe_update_rates(State = #vqstate{ in_counter  = InCount,
                                      out_counter = OutCount })
@@ -1028,7 +1028,7 @@ convert_to_lazy(State0 = #vqstate { mode = Mode, init_mode = InitMode }) ->
     case Delta#delta.count + ?QUEUE:len(Q3) == Len of
         true ->
             io:format("convert_to_lazy mode = lazy~n"),
-            State1#vqstate { mode = lazy, init_mode = undefined };
+            a(State1#vqstate { mode = lazy, init_mode = undefined });
         false ->
             %% When pushing messages to disk, we might have been
             %% blocked by the msg_store, so we need to see if we have
