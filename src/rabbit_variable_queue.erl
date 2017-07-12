@@ -319,6 +319,8 @@
 
           %% default queue or lazy queue
           mode,
+          %% mode for which we are initializing
+          init_mode,
           %% number of reduce_memory_usage executions, once it
           %% reaches a threshold the queue will manually trigger a runtime GC
 	        %% see: maybe_execute_gc/1
@@ -326,6 +328,7 @@
           %% Queue data is grouped by VHost. We need to store it
           %% to work with queue index.
           virtual_host
+
         }).
 
 -record(rates, { in, out, ack_in, ack_out, timestamp }).
@@ -425,6 +428,7 @@
 
              io_batch_size         :: pos_integer(),
              mode                  :: 'default' | 'lazy',
+             init_mode             :: 'default' | 'lazy' | 'undefined',
              memory_reduction_run_count :: non_neg_integer()}.
 %% Duplicated from rabbit_backing_queue
 -spec ack([ack()], state()) -> {[rabbit_guid:guid()], state()}.
@@ -810,11 +814,13 @@ is_empty(State) -> 0 == len(State).
 depth(State) ->
     len(State) + count_pending_acks(State).
 
-% TODO HACK this completely ignores incoming DurationTarget
-% and assumes that we always want to reduce memory use
-set_ram_duration_target(DurationTarget, State = #vqstate { mode = lazy, target_ram_count = TargetRamCount }) ->
-    io:format("set_ram_duration_target Mode ~p DurationTarget ~p TargetRamCount ~p~n", [lazy, DurationTarget, TargetRamCount]),
-    maybe_reduce_memory_use(State);
+set_ram_duration_target(DurationTarget,
+                        State0 = #vqstate { init_mode = lazy,
+                                            target_ram_count = TargetRamCount }) ->
+    io:format("set_ram_duration_target Mode ~p InitMode ~p DurationTarget ~p TargetRamCount ~p~n",
+              [lazy, lazy_init, DurationTarget, TargetRamCount]),
+    State1 = reduce_memory_use(State0),
+    State1#vqstate{memory_reduction_run_count = 0};
 set_ram_duration_target(
   DurationTarget, State = #vqstate {
                     rates = #rates { in      = AvgIngressRate,
@@ -989,22 +995,24 @@ invoke(      _,   _, State) -> State.
 
 is_duplicate(_Msg, State) -> {false, State}.
 
-set_queue_mode(Mode, State = #vqstate { mode = Mode }) ->
+set_queue_mode(Mode, State = #vqstate { mode = Mode, init_mode = undefined }) ->
     % Note: since Mode matches Mode, queue mode has already been set
     State;
-set_queue_mode(lazy, State0) ->
-    % Note: in this case, incoming mode is default, and we need to
-    % do what it takes to switch it to lazy
-    % TODO HACK this hard-codes target_ram_count to always be 0
-    State1 = State0#vqstate { mode = lazy, target_ram_count = 0 },
+set_queue_mode(lazy, State0 = #vqstate { target_ram_count = InitialTargetRamCount }) ->
+    io:format("set_queue_mode lazy InitialTargetRamCount ~p~n", [InitialTargetRamCount]),
+    % Note: in this case, incoming mode in State0 is default,
+    % and we need to do what it takes to switch it to lazy
+    State1 = State0#vqstate { init_mode = lazy, target_ram_count = 0 },
     %% To become a lazy queue we need to page everything to disk first.
     State2 = convert_to_lazy(State1),
-    %% TODO ??? restore the original target_ram_count
-    a(State2);
-set_queue_mode(default, State) ->
+    %% restore the original target_ram_count
+    State3 = State2#vqstate { target_ram_count = InitialTargetRamCount },
+    a(State3);
+set_queue_mode(default, State0) ->
     %% becoming a default queue means loading messages from disk like
     %% when a queue is recovered.
-    a(maybe_deltas_to_betas(State #vqstate { mode = default }));
+    State1 = maybe_deltas_to_betas(State0#vqstate { mode = default, init_mode = default }),
+    a(State1#vqstate { mode = default, init_mode = undefined });
 set_queue_mode(_, State) ->
     State.
 
@@ -1013,12 +1021,14 @@ zip_msgs_and_acks(Msgs, AckTags, Accumulator, _State) ->
                         [{Id, AckTag} | Acc]
                 end, Accumulator, lists:zip(Msgs, AckTags)).
 
-convert_to_lazy(State) ->
+convert_to_lazy(State0 = #vqstate { mode = Mode, init_mode = InitMode }) ->
+    io:format("convert_to_lazy Mode ~p InitMode ~p~n", [Mode, InitMode]),
     State1 = #vqstate { delta = Delta, q3 = Q3, len = Len } =
-        set_ram_duration_target(0, State),
+        set_ram_duration_target(0, State0),
     case Delta#delta.count + ?QUEUE:len(Q3) == Len of
         true ->
-            State1;
+            io:format("convert_to_lazy mode = lazy~n"),
+            State1#vqstate { mode = lazy, init_mode = undefined };
         false ->
             %% When pushing messages to disk, we might have been
             %% blocked by the msg_store, so we need to see if we have
@@ -1100,6 +1110,7 @@ get_collection_head(Col, IsEmpty, GetVal) ->
 %%----------------------------------------------------------------------------
 a(State = #vqstate { q1 = Q1, q2 = Q2, delta = Delta, q3 = Q3, q4 = Q4,
                      mode             = default,
+                     init_mode        = undefined,
                      len              = Len,
                      bytes            = Bytes,
                      unacked_bytes    = UnackedBytes,
@@ -1139,6 +1150,7 @@ a(State = #vqstate { q1 = Q1, q2 = Q2, delta = Delta, q3 = Q3, q4 = Q4,
     State;
 a(State = #vqstate { q1 = Q1, q2 = Q2, delta = Delta, q3 = Q3, q4 = Q4,
                      mode             = lazy,
+                     init_mode        = undefined,
                      len              = Len,
                      bytes            = Bytes,
                      unacked_bytes    = UnackedBytes,
@@ -2397,14 +2409,6 @@ ifold(Fun, Acc, Its, State) ->
 %% Phase changes
 %%----------------------------------------------------------------------------
 
-% TODO HACK this ignores the GC run threshold introduced in these GH issues:
-%% https://github.com/rabbitmq/rabbitmq-server/issues/964
-%% https://github.com/rabbitmq/rabbitmq-server/issues/973
-maybe_reduce_memory_use(State = #vqstate { memory_reduction_run_count = MRedRunCount, mode = lazy }) ->
-    RunThreshold = ?EXPLICIT_GC_RUN_OP_THRESHOLD(lazy),
-    io:format("maybe_reduce_memory_user memory_reduction_run_count ~p threshold ~p~n", [MRedRunCount, RunThreshold]),
-    State1 = reduce_memory_use(State),
-    State1#vqstate{memory_reduction_run_count = 0};
 maybe_reduce_memory_use(State = #vqstate {memory_reduction_run_count = MRedRunCount,
                                           mode = Mode}) ->
     case MRedRunCount >= ?EXPLICIT_GC_RUN_OP_THRESHOLD(Mode) of
@@ -2415,6 +2419,21 @@ maybe_reduce_memory_use(State = #vqstate {memory_reduction_run_count = MRedRunCo
 
 reduce_memory_use(State = #vqstate { target_ram_count = infinity }) ->
     State;
+%% When initializing a lazy queue,
+%% we want to start with everything flushed to disk
+reduce_memory_use(State0 = #vqstate { init_mode = lazy,
+                                      ram_pending_ack  = RamPendingAck0,
+                                      ram_msg_count = RamMsgCount0 }) ->
+    RamAckQuota = RamMsgCount0 + gb_trees:size(RamPendingAck0),
+    io:format("reduce_memory_use init_mode = lazy RamAckQuota ~p~n", [RamAckQuota]),
+    {_Quota, State1} = limit_ram_acks(RamAckQuota, State0),
+    QueueLen = ?QUEUE:len(State1#vqstate.q3),
+    io:format("reduce_memory_use init_mode = lazy QueueLen ~p~n", [QueueLen]),
+    State2 = #vqstate { ram_msg_count = RamMsgCount1 } =
+        push_betas_to_deltas(QueueLen, State1),
+    io:format("reduce_memory_use init_mode = lazy RamMsgCount1 ~p~n", [RamMsgCount1]),
+    garbage_collect(),
+    State2;
 reduce_memory_use(State = #vqstate {
                     mode             = default,
                     ram_pending_ack  = RPA,
@@ -2687,31 +2706,36 @@ push_alphas_to_betas(Generator, Consumer, Quota, Q, State) ->
                  end
     end.
 
+%% In the case of lazy queues we want to page as many messages as
+%% possible from q3.
+push_betas_to_deltas(Quota, State = #vqstate { init_mode = lazy,
+                                               delta = Delta, q3 = Q3}) ->
+    push_betas_to_deltas_lazy(Quota, State, Delta, Q3);
+push_betas_to_deltas(Quota, State = #vqstate { mode = lazy,
+                                               delta = Delta, q3 = Q3}) ->
+    push_betas_to_deltas_lazy(Quota, State, Delta, Q3);
 push_betas_to_deltas(Quota, State = #vqstate { mode  = default,
                                                q2    = Q2,
                                                delta = Delta,
                                                q3    = Q3}) ->
     PushState = {Quota, Delta, State},
-    {Q3a, PushState1} = push_betas_to_deltas(
+    {Q3a, PushState1} = push_betas_to_deltas1(
                           fun ?QUEUE:out_r/1,
                           fun rabbit_queue_index:next_segment_boundary/1,
                           Q3, PushState),
-    {Q2a, PushState2} = push_betas_to_deltas(
+    {Q2a, PushState2} = push_betas_to_deltas1(
                           fun ?QUEUE:out/1,
                           fun (Q2MinSeqId) -> Q2MinSeqId end,
                           Q2, PushState1),
     {_, Delta1, State1} = PushState2,
     State1 #vqstate { q2    = Q2a,
                       delta = Delta1,
-                      q3    = Q3a };
-%% In the case of lazy queues we want to page as many messages as
-%% possible from q3.
-push_betas_to_deltas(Quota, State = #vqstate { mode  = lazy,
-                                               delta = Delta,
-                                               q3    = Q3}) ->
-    io:format("push_betas_to_deltas Quota ~p~n", [Quota]),
+                      q3    = Q3a }.
+
+push_betas_to_deltas_lazy(Quota, State, Delta, Q3) ->
+    io:format("push_betas_to_deltas_lazy Quota ~p~n", [Quota]),
     PushState = {Quota, Delta, State},
-    {Q3a, PushState1} = push_betas_to_deltas(
+    {Q3a, PushState1} = push_betas_to_deltas1(
                           fun ?QUEUE:out_r/1,
                           fun (Q2MinSeqId) -> Q2MinSeqId end,
                           Q3, PushState),
@@ -2719,8 +2743,7 @@ push_betas_to_deltas(Quota, State = #vqstate { mode  = lazy,
     State1 #vqstate { delta = Delta1,
                       q3    = Q3a }.
 
-
-push_betas_to_deltas(Generator, LimitFun, Q, PushState) ->
+push_betas_to_deltas1(Generator, LimitFun, Q, PushState) ->
     case ?QUEUE:is_empty(Q) of
         true ->
             {Q, PushState};
@@ -2730,13 +2753,13 @@ push_betas_to_deltas(Generator, LimitFun, Q, PushState) ->
             Limit = LimitFun(MinSeqId),
             case MaxSeqId < Limit of
                 true  -> {Q, PushState};
-                false -> push_betas_to_deltas1(Generator, Limit, Q, PushState)
+                false -> push_betas_to_deltas2(Generator, Limit, Q, PushState)
             end
     end.
 
-push_betas_to_deltas1(_Generator, _Limit, Q, {0, Delta, State}) ->
+push_betas_to_deltas2(_Generator, _Limit, Q, {0, Delta, State}) ->
     {Q, {0, Delta, ui(State)}};
-push_betas_to_deltas1(Generator, Limit, Q, {Quota, Delta, State}) ->
+push_betas_to_deltas2(Generator, Limit, Q, {Quota, Delta, State}) ->
     case Generator(Q) of
         {empty, _Q} ->
             {Q, {Quota, Delta, ui(State)}};
@@ -2749,7 +2772,7 @@ push_betas_to_deltas1(Generator, Limit, Q, {Quota, Delta, State}) ->
                 maybe_batch_write_index_to_disk(true, MsgStatus, State),
             State2 = stats(ready0, {MsgStatus, none}, 1, State1),
             Delta1 = expand_delta(SeqId, Delta, IsPersistent),
-            push_betas_to_deltas1(Generator, Limit, Qa,
+            push_betas_to_deltas2(Generator, Limit, Qa,
                                   {Quota - 1, Delta1, State2})
     end.
 
