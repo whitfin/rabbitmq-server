@@ -2400,7 +2400,9 @@ ifold(Fun, Acc, Its, State) ->
 % TODO HACK this ignores the GC run threshold introduced in these GH issues:
 %% https://github.com/rabbitmq/rabbitmq-server/issues/964
 %% https://github.com/rabbitmq/rabbitmq-server/issues/973
-maybe_reduce_memory_use(State = #vqstate { mode = lazy }) ->
+maybe_reduce_memory_use(State = #vqstate { memory_reduction_run_count = MRedRunCount, mode = lazy }) ->
+    RunThreshold = ?EXPLICIT_GC_RUN_OP_THRESHOLD(lazy),
+    io:format("maybe_reduce_memory_user memory_reduction_run_count ~p threshold ~p~n", [MRedRunCount, RunThreshold]),
     State1 = reduce_memory_use(State),
     State1#vqstate{memory_reduction_run_count = 0};
 maybe_reduce_memory_use(State = #vqstate {memory_reduction_run_count = MRedRunCount,
@@ -2467,6 +2469,7 @@ reduce_memory_use(State = #vqstate {
                              ram_pending_ack  = RPA,
                              ram_msg_count    = RamMsgCount,
                              target_ram_count = TargetRamCount }) ->
+    io:format("reduce_memory_use mode = lazy~n"),
     State1 = #vqstate { q3 = Q3 } =
         case chunk_size(RamMsgCount + gb_trees:size(RPA), TargetRamCount) of
             0  -> State;
@@ -2479,6 +2482,7 @@ reduce_memory_use(State = #vqstate {
             0  ->
                 State1;
             S2 ->
+                io:format("reduce_memory_use mode -> push_betas_to_deltas S2 ~p~n", [S2]),
                 push_betas_to_deltas(S2, State1)
         end,
     garbage_collect(),
